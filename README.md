@@ -1,1 +1,1 @@
-# ShinyServer
+# ShinyCollections
