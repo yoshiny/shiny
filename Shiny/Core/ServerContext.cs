@@ -19,6 +19,10 @@ namespace Shiny.Core {
         public long CurrentFrame => m_Server.CurrentFrame;
         public long TickInterval => m_Server.TickInterval;
 
+        public void VerifyAccess() {
+            m_Server.VerifyAccess();
+        }
+
         public void PostMessage(IServerMessage message) {
             m_Server.PostMessage(message);
         }
@@ -33,7 +37,7 @@ namespace Shiny.Core {
         }
 
         public void RunAsync<TState>(TState state, Func<TState, Task> asyncAction) {
-            m_Server.RunAsync<TState>(state, asyncAction);
+            m_Server.RunAsync(state, asyncAction);
         }
 
         public TModule GetModule<TModule>() where TModule : class, IModule {

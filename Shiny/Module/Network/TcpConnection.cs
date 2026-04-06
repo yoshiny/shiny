@@ -11,33 +11,33 @@ using System.Threading.Tasks;
 
 namespace Shiny.Module.Network {
     internal sealed class TcpConnection : IDisposable {
-        private readonly NetModule _owner;
-        private readonly NetService _service;
-        private readonly Socket _socket;
+        private readonly NetModule m_Owner;
+        private readonly NetService m_Service;
+        private readonly Socket m_Socket;
 
-        private readonly INetFrameDecoder _decoder;
-        private readonly INetFrameEncoder _encoder;
+        private readonly INetFrameDecoder m_Decoder;
+        private readonly INetFrameEncoder m_Encoder;
 
-        private readonly Pipe _recvPipe;
+        private readonly Pipe m_RecvPipe;
 
-        private readonly SocketAsyncEventArgs _recvArgs;
-        private readonly SocketAsyncEventArgs _sendArgs;
+        private readonly SocketAsyncEventArgs m_RecvArgs;
+        private readonly SocketAsyncEventArgs m_SendArgs;
 
-        private readonly byte[] _recvBuffer;
+        private readonly byte[] m_RecvBuffer;
 
-        private readonly object _sendLock = new();
-        private readonly Queue<OutgoingPacket> _sendQueue = new();
+        private readonly object m_SendLock = new();
+        private readonly Queue<OutgoingPacket> m_SendQueue = new();
 
-        private bool _sendScheduled;
-        private bool _disposed;
-        private bool _closedEventRaised;
+        private bool m_SendScheduled;
+        private bool m_Disposed;
+        private bool m_ClosedEventRaised;
 
-        private byte[]? _currentSendBuffer;
-        private IDisposable? _currentSendOwner;
+        private byte[]? m_CurrentSendBuffer;
+        private IDisposable? m_CurrentSendOwner;
 
         public long ConnectionId { get; }
-        public int ServiceId => _service.ServiceId;
-        public string ServiceName => _service.Name;
+        public int ServiceId => m_Service.ServiceId;
+        public string ServiceName => m_Service.Name;
 
         public ConnectionInfo Info => new() {
             ConnectionId = ConnectionId,
@@ -48,15 +48,15 @@ namespace Shiny.Module.Network {
         };
 
         public TcpConnection(NetModule owner, NetService service, long connectionId, Socket socket, int receiveBufferSize) {
-            _owner = owner;
-            _service = service;
-            _socket = socket;
+            m_Owner = owner;
+            m_Service = service;
+            m_Socket = socket;
             ConnectionId = connectionId;
 
-            _decoder = service.Protocol.CreateDecoder();
-            _encoder = service.Protocol.CreateEncoder();
+            m_Decoder = service.Protocol.CreateDecoder();
+            m_Encoder = service.Protocol.CreateEncoder();
 
-            _recvPipe = new Pipe(new PipeOptions(
+            m_RecvPipe = new Pipe(new PipeOptions(
                 pool: MemoryPool<byte>.Shared,
                 readerScheduler: PipeScheduler.Inline,
                 writerScheduler: PipeScheduler.Inline,
@@ -65,15 +65,15 @@ namespace Shiny.Module.Network {
                 minimumSegmentSize: 4096,
                 useSynchronizationContext: false));
 
-            _recvBuffer = ArrayPool<byte>.Shared.Rent(receiveBufferSize);
+            m_RecvBuffer = ArrayPool<byte>.Shared.Rent(receiveBufferSize);
 
-            _recvArgs = new SocketAsyncEventArgs();
-            _sendArgs = new SocketAsyncEventArgs();
+            m_RecvArgs = new SocketAsyncEventArgs();
+            m_SendArgs = new SocketAsyncEventArgs();
 
-            _recvArgs.Completed += OnRecvCompleted;
-            _sendArgs.Completed += OnSendCompleted;
+            m_RecvArgs.Completed += OnRecvCompleted;
+            m_SendArgs.Completed += OnSendCompleted;
 
-            _recvArgs.SetBuffer(_recvBuffer, 0, _recvBuffer.Length);
+            m_RecvArgs.SetBuffer(m_RecvBuffer, 0, m_RecvBuffer.Length);
         }
 
         public void Start() {
@@ -81,75 +81,81 @@ namespace Shiny.Module.Network {
         }
 
         public bool EnqueueSend<T>(T message) {
-            if (_disposed)
+            if (m_Disposed) {
                 return false;
+            }
 
             EncodedBuffer encoded;
             try {
-                encoded = _encoder.Encode(message);
+                encoded = m_Encoder.Encode(message);
             } catch {
                 return false;
             }
 
-            if (!encoded.IsValid)
+            if (!encoded.IsValid) {
                 return false;
+            }
 
-            lock (_sendLock) {
-                if (_disposed) {
+            lock (m_SendLock) {
+                if (m_Disposed) {
                     encoded.Release();
                     return false;
                 }
-
-                _sendQueue.Enqueue(new OutgoingPacket(encoded));
+                m_SendQueue.Enqueue(new OutgoingPacket(encoded));
             }
 
-            _owner.MarkConnectionPendingFlush(this);
+            m_Owner.MarkConnectionPendingFlush(this);
             return true;
         }
 
         public bool EnqueueRaw(ReadOnlyMemory<byte> payload) {
-            if (_disposed)
+            if (m_Disposed) {
                 return false;
+            }
 
             var arr = payload.ToArray();
             var encoded = new EncodedBuffer(arr, 0, arr.Length);
 
-            lock (_sendLock) {
-                if (_disposed)
+            lock (m_SendLock) {
+                if (m_Disposed) {
                     return false;
-
-                _sendQueue.Enqueue(new OutgoingPacket(encoded));
+                }
+                m_SendQueue.Enqueue(new OutgoingPacket(encoded));
             }
 
-            _owner.MarkConnectionPendingFlush(this);
+            m_Owner.MarkConnectionPendingFlush(this);
             return true;
         }
 
         public void TryScheduleSend() {
-            if (_disposed)
+            if (m_Disposed) {
                 return;
+            }
 
-            lock (_sendLock) {
-                if (_disposed || _sendScheduled)
+            lock (m_SendLock) {
+                if (m_Disposed || m_SendScheduled) {
                     return;
+                }
 
-                if (_sendQueue.Count == 0)
+                if (m_SendQueue.Count == 0) {
                     return;
+                }
 
-                if (!BuildSendBuffer_NoLock(out var buffer, out var owner))
+                if (!BuildSendBuffer_NoLock(out var buffer, out var owner)) {
                     return;
+                }
 
-                _sendScheduled = true;
-                _currentSendBuffer = buffer;
-                _currentSendOwner = owner;
+                m_SendScheduled = true;
+                m_CurrentSendBuffer = buffer;
+                m_CurrentSendOwner = owner;
 
-                _sendArgs.SetBuffer(_currentSendBuffer, 0, _currentSendBuffer.Length);
+                m_SendArgs.SetBuffer(m_CurrentSendBuffer, 0, m_CurrentSendBuffer.Length);
             }
 
             try {
-                bool pending = _socket.SendAsync(_sendArgs);
+                bool pending = m_Socket.SendAsync(m_SendArgs);
                 if (!pending) {
-                    ProcessSend(_sendArgs);
+                    ProcessSend(m_SendArgs);
                 }
             } catch (Exception) {
                 Close(NetCloseReason.SendError);
@@ -157,21 +163,23 @@ namespace Shiny.Module.Network {
         }
 
         public void Close(NetCloseReason reason) {
-            if (_disposed)
+            if (m_Disposed) {
                 return;
+            }
 
             DisposeSocketOnly();
             RaiseClosed(reason);
         }
 
         private void StartReceive() {
-            if (_disposed)
+            if (m_Disposed) {
                 return;
+            }
 
             try {
-                bool pending = _socket.ReceiveAsync(_recvArgs);
+                bool pending = m_Socket.ReceiveAsync(m_RecvArgs);
                 if (!pending) {
-                    ProcessReceive(_recvArgs);
+                    ProcessReceive(m_RecvArgs);
                 }
             } catch {
                 Close(NetCloseReason.ReceiveError);
@@ -183,8 +191,9 @@ namespace Shiny.Module.Network {
         }
 
         private void ProcessReceive(SocketAsyncEventArgs e) {
-            if (_disposed)
+            if (m_Disposed) {
                 return;
+            }
 
             if (e.SocketError != SocketError.Success) {
                 Close(NetCloseReason.ReceiveError);
@@ -197,8 +206,8 @@ namespace Shiny.Module.Network {
             }
 
             try {
-                _recvPipe.Writer.Write(e.Buffer!.AsSpan(e.Offset, e.BytesTransferred));
-                var flushResult = _recvPipe.Writer.FlushAsync().GetAwaiter().GetResult();
+                m_RecvPipe.Writer.Write(e.Buffer!.AsSpan(e.Offset, e.BytesTransferred));
+                var flushResult = m_RecvPipe.Writer.FlushAsync().GetAwaiter().GetResult();
 
                 DecodeAvailableFrames();
 
@@ -216,23 +225,24 @@ namespace Shiny.Module.Network {
 
         private void DecodeAvailableFrames() {
             while (true) {
-                var result = _recvPipe.Reader.ReadAsync().GetAwaiter().GetResult();
+                var result = m_RecvPipe.Reader.ReadAsync().GetAwaiter().GetResult();
                 var buffer = result.Buffer;
 
                 try {
-                    while (_decoder.TryDecode(ref buffer, out var packet)) {
-                        var msg = _service.MessageAdapter.CreateReceiveMessage(Info, packet);
-                        _owner.PostToServer(msg);
+                    while (m_Decoder.TryDecode(ref buffer, out var packet)) {
+                        var msg = m_Service.MessageAdapter.CreateReceiveMessage(Info, packet);
+                        m_Owner.PostInternal(new NetReceivedInternalMessage(ConnectionId, packet));
                     }
                 } catch {
-                    _recvPipe.Reader.AdvanceTo(buffer.Start, buffer.End);
+                    m_RecvPipe.Reader.AdvanceTo(buffer.Start, buffer.End);
                     throw;
                 }
 
-                _recvPipe.Reader.AdvanceTo(buffer.Start, buffer.End);
+                m_RecvPipe.Reader.AdvanceTo(buffer.Start, buffer.End);
 
-                if (result.IsCompleted || buffer.Length == 0)
+                if (result.IsCompleted || buffer.Length == 0) {
                     break;
+                }
             }
         }
 
@@ -243,17 +253,18 @@ namespace Shiny.Module.Network {
         private void ProcessSend(SocketAsyncEventArgs e) {
             IDisposable? ownerToRelease = null;
 
-            lock (_sendLock) {
-                ownerToRelease = _currentSendOwner;
-                _currentSendOwner = null;
-                _currentSendBuffer = null;
-                _sendScheduled = false;
+            lock (m_SendLock) {
+                ownerToRelease = m_CurrentSendOwner;
+                m_CurrentSendOwner = null;
+                m_CurrentSendBuffer = null;
+                m_SendScheduled = false;
             }
 
             ownerToRelease?.Dispose();
 
-            if (_disposed)
+            if (m_Disposed) {
                 return;
+            }
 
             if (e.SocketError != SocketError.Success) {
                 Close(NetCloseReason.SendError);
@@ -267,11 +278,12 @@ namespace Shiny.Module.Network {
             owner = null;
             buffer = Array.Empty<byte>();
 
-            if (_sendQueue.Count == 0)
+            if (m_SendQueue.Count == 0) {
                 return false;
+            }
 
-            if (_sendQueue.Count == 1) {
-                var packet = _sendQueue.Dequeue();
+            if (m_SendQueue.Count == 1) {
+                var packet = m_SendQueue.Dequeue();
                 var src = packet.Buffer;
 
                 if (src.Array == null || src.Length <= 0) {
@@ -290,15 +302,15 @@ namespace Shiny.Module.Network {
             }
 
             int total = 0;
-            foreach (var packet in _sendQueue) {
+            foreach (var packet in m_SendQueue) {
                 total += packet.Buffer.Length;
             }
 
             var merged = ArrayPool<byte>.Shared.Rent(total);
             int writeOffset = 0;
 
-            while (_sendQueue.Count > 0) {
-                var packet = _sendQueue.Dequeue();
+            while (m_SendQueue.Count > 0) {
+                var packet = m_SendQueue.Dequeue();
                 var src = packet.Buffer;
 
                 if (src.Array != null && src.Length > 0) {
@@ -330,58 +342,59 @@ namespace Shiny.Module.Network {
         }
 
         private EndPoint? SafeLocalEndPoint() {
-            try { return _socket.LocalEndPoint; } catch { return null; }
+            try { return m_Socket.LocalEndPoint; } catch { return null; }
         }
 
         private EndPoint? SafeRemoteEndPoint() {
-            try { return _socket.RemoteEndPoint; } catch { return null; }
+            try { return m_Socket.RemoteEndPoint; } catch { return null; }
         }
 
         private void DisposeSocketOnly() {
-            if (_disposed)
+            if (m_Disposed) {
                 return;
+            }
 
-            _disposed = true;
+            m_Disposed = true;
 
-            try { _socket.Shutdown(SocketShutdown.Both); } catch { }
-            try { _socket.Close(); } catch { }
+            try { m_Socket.Shutdown(SocketShutdown.Both); } catch { }
+            try { m_Socket.Close(); } catch { }
         }
 
         private void RaiseClosed(NetCloseReason reason) {
-            if (_closedEventRaised)
+            if (m_ClosedEventRaised)
                 return;
 
-            _closedEventRaised = true;
-            _owner.OnConnectionClosed(this, reason);
+            m_ClosedEventRaised = true;
+            m_Owner.PostInternal(new NetClosedInternalMessage(ConnectionId, reason));
         }
 
         public void Dispose() {
             DisposeSocketOnly();
 
             try {
-                _recvArgs.Dispose();
-                _sendArgs.Dispose();
+                m_RecvArgs.Dispose();
+                m_SendArgs.Dispose();
             } catch {
             }
 
             try {
-                _recvPipe.Reader.Complete();
-                _recvPipe.Writer.Complete();
+                m_RecvPipe.Reader.Complete();
+                m_RecvPipe.Writer.Complete();
             } catch {
             }
 
-            lock (_sendLock) {
-                while (_sendQueue.Count > 0) {
-                    var packet = _sendQueue.Dequeue();
+            lock (m_SendLock) {
+                while (m_SendQueue.Count > 0) {
+                    var packet = m_SendQueue.Dequeue();
                     packet.Buffer.Release();
                 }
 
-                _currentSendOwner?.Dispose();
-                _currentSendOwner = null;
-                _currentSendBuffer = null;
+                m_CurrentSendOwner?.Dispose();
+                m_CurrentSendOwner = null;
+                m_CurrentSendBuffer = null;
             }
 
-            ArrayPool<byte>.Shared.Return(_recvBuffer);
+            ArrayPool<byte>.Shared.Return(m_RecvBuffer);
         }
     }
 }

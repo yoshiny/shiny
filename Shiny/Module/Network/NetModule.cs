@@ -1,6 +1,7 @@
 ﻿using Shiny.Core;
 using Shiny.Feature;
 using Shiny.Message;
+using Shiny.Module.Network.Internal;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -18,14 +19,18 @@ namespace Shiny.Module.Network {
         private readonly Dictionary<int, NetService> m_Services = new();
         private readonly Dictionary<long, TcpConnection> m_Connections = new();
 
-        // 逻辑线程使用；确认只在逻辑线程访问后，也可换成 Queue<TcpConnection>
-        private readonly ConcurrentQueue<TcpConnection> m_PendingFlushConnections = new();
-        // 防止同一个连接反复入 flush 队列
-        private readonly ConcurrentDictionary<long, byte> m_PendingFlushSet = new();
+        private readonly Queue<TcpConnection> m_PendingFlushConnections = new();
+        private readonly HashSet<long> m_PendingFlushSet = new();
 
 
         public void OnInit(ServerContext context) {
             m_ServerContext = context;
+
+            context.Dispatcher.Register<NetAcceptedInternalMessage>(OnAcceptedInternal);
+            context.Dispatcher.Register<NetConnectedInternalMessage>(OnConnectedInternal);
+            context.Dispatcher.Register<NetConnectFailedInternalMessage>(OnConnectFailedInternal);
+            context.Dispatcher.Register<NetReceivedInternalMessage>(OnReceivedInternal);
+            context.Dispatcher.Register<NetClosedInternalMessage>(OnClosedInternal);
         }
 
         public void OnStart() {
@@ -33,12 +38,14 @@ namespace Shiny.Module.Network {
         }
 
         public void OnPostTick() {
+            m_ServerContext.VerifyAccess();
             Flush();
         }
 
         public void OnStop() {
+            m_ServerContext.VerifyAccess();
+
             foreach (var conn in m_Connections.Values.ToArray()) {
-                conn.Close(NetCloseReason.ServiceStopped);
                 conn.Dispose();
             }
             m_Connections.Clear();
@@ -48,12 +55,13 @@ namespace Shiny.Module.Network {
             }
             m_Services.Clear();
 
-            while (m_PendingFlushConnections.TryDequeue(out _)) {
-            }
+            m_PendingFlushConnections.Clear();
             m_PendingFlushSet.Clear();
         }
 
         public int StartTcpListener(TcpListenOptions options) {
+            m_ServerContext.VerifyAccess();
+
             ArgumentNullException.ThrowIfNull(options);
             ArgumentNullException.ThrowIfNull(options.Protocol);
             ArgumentNullException.ThrowIfNull(options.MessageAdapter);
@@ -68,6 +76,8 @@ namespace Shiny.Module.Network {
         }
 
         public int StartTcpConnector(TcpConnectOptions options) {
+            m_ServerContext.VerifyAccess();
+
             ArgumentNullException.ThrowIfNull(options);
             ArgumentNullException.ThrowIfNull(options.Protocol);
             ArgumentNullException.ThrowIfNull(options.MessageAdapter);
@@ -82,6 +92,8 @@ namespace Shiny.Module.Network {
         }
 
         public bool StopService(int serviceId) {
+            m_ServerContext.VerifyAccess();
+
             if (!m_Services.Remove(serviceId, out var service)) {
                 return false;
             }
@@ -97,22 +109,29 @@ namespace Shiny.Module.Network {
         }
 
         public bool Send<T>(long connectionId, T message) {
+            m_ServerContext.VerifyAccess();
+
             if (!m_Connections.TryGetValue(connectionId, out var conn)) {
                 return false;
             }
+
             return conn.EnqueueSend(message);
         }
 
         public bool SendPacket(long connectionId, ReadOnlyMemory<byte> payload) {
+            m_ServerContext.VerifyAccess();
+
             if (!m_Connections.TryGetValue(connectionId, out var conn)) {
                 return false;
             }
+
             return conn.EnqueueRaw(payload);
         }
 
         public int Broadcast<T>(int serviceId, T message, Predicate<ConnectionInfo>? filter = null) {
-            int count = 0;
+            m_ServerContext.VerifyAccess();
 
+            int count = 0;
             foreach (var conn in m_Connections.Values) {
                 if (conn.ServiceId != serviceId) {
                     continue;
@@ -130,14 +149,19 @@ namespace Shiny.Module.Network {
         }
 
         public bool Disconnect(long connectionId) {
-            if (!m_Connections.TryGetValue(connectionId, out var conn))
+            m_ServerContext.VerifyAccess();
+
+            if (!m_Connections.TryGetValue(connectionId, out var conn)) {
                 return false;
+            }
 
             conn.Close(NetCloseReason.LocalClosed);
             return true;
         }
 
         public bool TryGetConnectionInfo(long connectionId, out ConnectionInfo info) {
+            m_ServerContext.VerifyAccess();
+
             if (m_Connections.TryGetValue(connectionId, out var conn)) {
                 info = conn.Info;
                 return true;
@@ -148,8 +172,9 @@ namespace Shiny.Module.Network {
         }
 
         public IReadOnlyList<ConnectionInfo> GetConnectionsByService(int serviceId) {
-            var list = new List<ConnectionInfo>();
+            m_ServerContext.VerifyAccess();
 
+            var list = new List<ConnectionInfo>();
             foreach (var conn in m_Connections.Values) {
                 if (conn.ServiceId == serviceId) {
                     list.Add(conn.Info);
@@ -160,9 +185,11 @@ namespace Shiny.Module.Network {
         }
 
         public void Flush() {
-            while (m_PendingFlushConnections.TryDequeue(out var conn)) {
-                m_PendingFlushSet.TryRemove(conn.ConnectionId, out _);
+            m_ServerContext.VerifyAccess();
 
+            while (m_PendingFlushConnections.Count > 0) {
+                var conn = m_PendingFlushConnections.Dequeue();
+                m_PendingFlushSet.Remove(conn.ConnectionId);
                 if (m_Connections.ContainsKey(conn.ConnectionId)) {
                     conn.TryScheduleSend();
                 }
@@ -170,59 +197,104 @@ namespace Shiny.Module.Network {
         }
 
         internal void MarkConnectionPendingFlush(TcpConnection conn) {
-            if (m_PendingFlushSet.TryAdd(conn.ConnectionId, 0)) {
+            m_ServerContext.VerifyAccess();
+
+            if (m_PendingFlushSet.Add(conn.ConnectionId)) {
                 m_PendingFlushConnections.Enqueue(conn);
             }
         }
 
-        internal void RegisterAcceptedConnection(NetService service, Socket socket, int receiveBufferSize) {
-            long connId = Interlocked.Increment(ref m_NextConnectionId);
-            var conn = new TcpConnection(this, service, connId, socket, receiveBufferSize);
+        internal void PostInternal(IServerMessage message) {
+            m_ServerContext.PostMessage(message);
+        }
 
+        private void OnAcceptedInternal(NetAcceptedInternalMessage msg) {
+            m_ServerContext.VerifyAccess();
+
+            if (!m_Services.TryGetValue(msg.ServiceId, out var service)) {
+                msg.Socket.Dispose();
+                return;
+            }
+
+            long connId = Interlocked.Increment(ref m_NextConnectionId);
+            var conn = new TcpConnection(this, service, connId, msg.Socket, msg.ReceiveBufferSize);
             m_Connections.Add(connId, conn);
 
-            var msg = service.MessageAdapter.CreateConnectedMessage(conn.Info);
-            PostToServer(msg);
+            var connectedMessage = service.MessageAdapter.CreateConnectedMessage(conn.Info);
+            m_ServerContext.PostMessage(connectedMessage);
 
             conn.Start();
         }
 
-        internal TcpConnection RegisterConnectedOutbound(NetService service, Socket socket, int receiveBufferSize) {
-            long connId = Interlocked.Increment(ref m_NextConnectionId);
-            var conn = new TcpConnection(this, service, connId, socket, receiveBufferSize);
+        private void OnConnectedInternal(NetConnectedInternalMessage msg) {
+            m_ServerContext.VerifyAccess();
 
+            if (!m_Services.TryGetValue(msg.ServiceId, out var service)) {
+                msg.Socket.Dispose();
+                return;
+            }
+
+            long connId = Interlocked.Increment(ref m_NextConnectionId);
+            var conn = new TcpConnection(this, service, connId, msg.Socket, msg.ReceiveBufferSize);
             m_Connections.Add(connId, conn);
 
-            var msg = service.MessageAdapter.CreateConnectedMessage(conn.Info);
-            PostToServer(msg);
+            var connectedMessage = service.MessageAdapter.CreateConnectedMessage(conn.Info);
+            m_ServerContext.PostMessage(connectedMessage);
 
-            return conn;
+            conn.Start();
         }
 
-        internal void OnConnectionClosed(TcpConnection conn, NetCloseReason reason) {
-            if (m_Connections.Remove(conn.ConnectionId)) {
-                var msg = conn.Info.ServiceId != 0
-                    ? m_Services.TryGetValue(conn.ServiceId, out var service)
-                        ? service.MessageAdapter.CreateDisconnectedMessage(conn.Info, reason)
-                        : null
-                    : null;
+        private void OnConnectFailedInternal(NetConnectFailedInternalMessage msg) {
+            m_ServerContext.VerifyAccess();
 
-                conn.Dispose();
+            if (!m_Services.TryGetValue(msg.ServiceId, out var service)) {
+                return;
+            }
 
-                if (msg != null) {
-                    PostToServer(msg);
-                }
+            var businssMessage = service.MessageAdapter.CreateConnectFailedMessage(service.ServiceId, service.Name, msg.Exception);
+            m_ServerContext.PostMessage(businssMessage);
 
-                if (m_Services.TryGetValue(conn.ServiceId, out var netService) && netService is TcpConnectService connector) {
-                    // 先简单处理：如果是出站服务断开，由 connector 自己重新 Start
-                    // 若后续想避免重复启动，需要给 TcpConnectService 增加状态机
-                    connector.Start();
+            if (service is TcpConnectService connector) {
+                connector.RequestReconnect();
+            }
+        }
+
+        private void OnReceivedInternal(NetReceivedInternalMessage msg) {
+            m_ServerContext.VerifyAccess();
+
+            if (!m_Connections.TryGetValue(msg.ConnectionId, out var conn)) {
+                return;
+            }
+
+            if (!m_Services.TryGetValue(conn.ServiceId, out var service)) {
+                return;
+            }
+
+            var businessMessage = service.MessageAdapter.CreateReceiveMessage(conn.Info, msg.Packet);
+            m_ServerContext.PostMessage(businessMessage);
+        }
+
+        private void OnClosedInternal(NetClosedInternalMessage msg) {
+            m_ServerContext.VerifyAccess();
+
+            if (!m_Connections.Remove(msg.ConnectionId, out var conn)) {
+                return;
+            }
+
+            m_PendingFlushSet.Remove(msg.ConnectionId);
+
+            var info = conn.Info;
+            conn.Dispose();
+
+            if (m_Services.TryGetValue(info.ServiceId, out var service)) {
+                var businessMessage = service.MessageAdapter.CreateDisconnectedMessage(info, msg.Reason);
+                m_ServerContext.PostMessage(businessMessage);
+
+                if (service is TcpConnectService connector) {
+                    connector.RequestReconnect();
                 }
             }
         }
 
-        internal void PostToServer(IServerMessage message) {
-            m_ServerContext.PostMessage(message);
-        }
     }
 }
