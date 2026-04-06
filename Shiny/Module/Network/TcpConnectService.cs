@@ -20,26 +20,26 @@ namespace Shiny.Module.Network {
 
         public override void Start() {
             m_Running = true;
-            TryStartConnectLoop();
+            TryStartConnectLoop(false);
         }
 
         public void RequestReconnect() {
             if (!m_Running || !m_Options.AutoReconnect) {
                 return;
             }
-            TryStartConnectLoop();
+            TryStartConnectLoop(true);
         }
 
-        private void TryStartConnectLoop() {
+        private void TryStartConnectLoop(bool delayBeforeConnect) {
             if (Interlocked.CompareExchange(ref m_ConnectLoopActive, 1, 0) != 0) {
                 return;
             }
-            _ = Task.Run(ConnectLoopAsync);
+            _ = Task.Run(()=> ConnectLoopAsync(delayBeforeConnect));
         }
 
-        private async Task ConnectLoopAsync() {
+        private async Task ConnectLoopAsync(bool delayBeforeConnect) {
             try {
-                if (m_Options.AutoReconnect) {
+                if (delayBeforeConnect) {
                     await Task.Delay(m_Options.ReconnectDelayMs).ConfigureAwait(false);
                 }
                 while (m_Running) {

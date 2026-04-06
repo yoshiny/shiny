@@ -5,6 +5,7 @@ using Shiny.Module.Network.Internal;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Data;
 using System.Linq;
 using System.Net.Sockets;
 using System.Text;
@@ -18,6 +19,7 @@ namespace Shiny.Module.Network {
 
         private readonly Dictionary<int, NetService> m_Services = new();
         private readonly Dictionary<long, TcpConnection> m_Connections = new();
+        private readonly Dictionary<int, int> m_ServiceConnectionCounts = new();
 
         private readonly Queue<TcpConnection> m_PendingFlushConnections = new();
         private readonly HashSet<long> m_PendingFlushSet = new();
@@ -54,7 +56,7 @@ namespace Shiny.Module.Network {
                 service.Dispose();
             }
             m_Services.Clear();
-
+            m_ServiceConnectionCounts.Clear();
             m_PendingFlushConnections.Clear();
             m_PendingFlushSet.Clear();
         }
@@ -70,6 +72,7 @@ namespace Shiny.Module.Network {
             var service = new TcpListenService(this, serviceId, options);
 
             m_Services.Add(serviceId, service);
+            m_ServiceConnectionCounts.Add(serviceId, 0);
             service.Start();
 
             return serviceId;
@@ -96,6 +99,10 @@ namespace Shiny.Module.Network {
 
             if (!m_Services.Remove(serviceId, out var service)) {
                 return false;
+            }
+
+            if (service is TcpListenService) {
+                m_ServiceConnectionCounts.Remove(serviceId);
             }
 
             service.Dispose();
@@ -184,16 +191,9 @@ namespace Shiny.Module.Network {
             return list;
         }
 
-        public void Flush() {
+        public int GetServiceConnectionCount(int serviceId) {
             m_ServerContext.VerifyAccess();
-
-            while (m_PendingFlushConnections.Count > 0) {
-                var conn = m_PendingFlushConnections.Dequeue();
-                m_PendingFlushSet.Remove(conn.ConnectionId);
-                if (m_Connections.ContainsKey(conn.ConnectionId)) {
-                    conn.TryScheduleSend();
-                }
-            }
+            return m_ServiceConnectionCounts.TryGetValue(serviceId, out var count) ? count : 0;
         }
 
         internal void MarkConnectionPendingFlush(TcpConnection conn) {
@@ -208,6 +208,18 @@ namespace Shiny.Module.Network {
             m_ServerContext.PostMessage(message);
         }
 
+        private void Flush() {
+            m_ServerContext.VerifyAccess();
+
+            while (m_PendingFlushConnections.Count > 0) {
+                var conn = m_PendingFlushConnections.Dequeue();
+                m_PendingFlushSet.Remove(conn.ConnectionId);
+                if (m_Connections.ContainsKey(conn.ConnectionId)) {
+                    conn.TryScheduleSend();
+                }
+            }
+        }
+
         private void OnAcceptedInternal(NetAcceptedInternalMessage msg) {
             m_ServerContext.VerifyAccess();
 
@@ -216,9 +228,25 @@ namespace Shiny.Module.Network {
                 return;
             }
 
+            if (service is not TcpListenService listenService) {
+                msg.Socket.Dispose();
+                return;
+            }
+
+            if (!m_ServiceConnectionCounts.TryGetValue(msg.ServiceId, out int currentCount)) {
+                msg.Socket.Dispose();
+                return;
+            }
+
+            if (currentCount >= listenService.Options.MaxConnections) {
+                msg.Socket.Dispose();
+                return;
+            }
+
             long connId = Interlocked.Increment(ref m_NextConnectionId);
             var conn = new TcpConnection(this, service, connId, msg.Socket, msg.ReceiveBufferSize);
             m_Connections.Add(connId, conn);
+            m_ServiceConnectionCounts[msg.ServiceId] = currentCount + 1;
 
             var connectedMessage = service.MessageAdapter.CreateConnectedMessage(conn.Info);
             m_ServerContext.PostMessage(connectedMessage);
@@ -287,6 +315,12 @@ namespace Shiny.Module.Network {
             conn.Dispose();
 
             if (m_Services.TryGetValue(info.ServiceId, out var service)) {
+                if (service is TcpListenService) {
+                    if (m_ServiceConnectionCounts.TryGetValue(info.ServiceId, out int count) && count > 0) {
+                        m_ServiceConnectionCounts[info.ServiceId] = count - 1;
+                    }
+                }
+
                 var businessMessage = service.MessageAdapter.CreateDisconnectedMessage(info, msg.Reason);
                 m_ServerContext.PostMessage(businessMessage);
 

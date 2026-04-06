@@ -13,6 +13,8 @@ namespace Shiny.Module.Network {
         private Socket? m_ListenSocket;
         private volatile bool m_Running;
 
+        public TcpListenOptions Options => m_Options;
+
         public TcpListenService(NetModule owner, int serviceId, TcpListenOptions options)
             : base(owner, serviceId, options.Name, NetServiceKind.Listener, options.Protocol, options.MessageAdapter) {
             m_Options = options;
